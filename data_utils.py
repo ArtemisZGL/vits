@@ -49,6 +49,7 @@ class TextAudioLoader(torch.utils.data.Dataset):
         audiopaths_and_text_new = []
         lengths = []
         for audiopath, text in self.audiopaths_and_text:
+            # 只有规定文本长度范围内的才会拿来训练或测试
             if self.min_text_len <= len(text) and len(text) <= self.max_text_len:
                 audiopaths_and_text_new.append([audiopath, text])
                 lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
@@ -67,9 +68,9 @@ class TextAudioLoader(torch.utils.data.Dataset):
         if sampling_rate != self.sampling_rate:
             raise ValueError("{} {} SR doesn't match target {} SR".format(
                 sampling_rate, self.sampling_rate))
-        audio_norm = audio / self.max_wav_value
+        audio_norm = audio / self.max_wav_value  # 归一化到-1,1
         audio_norm = audio_norm.unsqueeze(0)
-        spec_filename = filename.replace(".wav", ".spec.pt")
+        spec_filename = filename.replace(".wav", ".spec.pt")  # 存为频谱数据
         if os.path.exists(spec_filename):
             spec = torch.load(spec_filename)
         else:
@@ -81,10 +82,12 @@ class TextAudioLoader(torch.utils.data.Dataset):
         return spec, audio_norm
 
     def get_text(self, text):
+        # 文本转为对应id
         if self.cleaned_text:
             text_norm = cleaned_text_to_sequence(text)
         else:
             text_norm = text_to_sequence(text, self.text_cleaners)
+        # 每个中间插入pad字符0
         if self.add_blank:
             text_norm = commons.intersperse(text_norm, 0)
         text_norm = torch.LongTensor(text_norm)
@@ -125,6 +128,7 @@ class TextAudioCollate():
         text_padded = torch.LongTensor(len(batch), max_text_len)
         spec_padded = torch.FloatTensor(len(batch), batch[0][1].size(0), max_spec_len)
         wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
+        # 先填充0作为默认值即padding
         text_padded.zero_()
         spec_padded.zero_()
         wav_padded.zero_()
@@ -315,11 +319,14 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
     def _create_buckets(self):
         buckets = [[] for _ in range(len(self.boundaries) - 1)]
         for i in range(len(self.lengths)):
+            # 这里应该是音频spec的长度
             length = self.lengths[i]
+            # 二分查找来获取bucket的下标，根据音频spec长度找对最符合其boundary的bucket
             idx_bucket = self._bisect(length)
             if idx_bucket != -1:
                 buckets[idx_bucket].append(i)
   
+        # 去除空bucket
         for i in range(len(buckets) - 1, 0, -1):
             if len(buckets[i]) == 0:
                 buckets.pop(i)
@@ -329,6 +336,7 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         for i in range(len(buckets)):
             len_bucket = len(buckets[i])
             total_batch_size = self.num_replicas * self.batch_size
+            # 计算最后一个不满一个total batch的sample数目
             rem = (total_batch_size - (len_bucket % total_batch_size)) % total_batch_size
             num_samples_per_bucket.append(len_bucket + rem)
         return buckets, num_samples_per_bucket
@@ -339,6 +347,7 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
       g.manual_seed(self.epoch)
   
       indices = []
+      # 获取每个bucket的sample下表列表，shuffle就随机生成，否则就按顺序
       if self.shuffle:
           for bucket in self.buckets:
               indices.append(torch.randperm(len(bucket), generator=g).tolist())
@@ -354,7 +363,8 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
           num_samples_bucket = self.num_samples_per_bucket[i]
   
           # add extra samples to make it evenly divisible
-          rem = num_samples_bucket - len_bucket
+          rem = num_samples_bucket - len_bucket  # 最后一个不满一个total batch的sample数目
+          # 扩展对应的indice，相当于有部分下标是重复的，凑够batch
           ids_bucket = ids_bucket + ids_bucket * (rem // len_bucket) + ids_bucket[:(rem % len_bucket)]
   
           # subsample
@@ -365,6 +375,7 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
               batch = [bucket[idx] for idx in ids_bucket[j*self.batch_size:(j+1)*self.batch_size]]
               batches.append(batch)
   
+      # 把batch也进行shuffle
       if self.shuffle:
           batch_ids = torch.randperm(len(batches), generator=g).tolist()
           batches = [batches[i] for i in batch_ids]

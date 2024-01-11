@@ -54,6 +54,7 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
   logs_p = logs_p.float()
   z_mask = z_mask.float()
 
+  # 两个都是正态分布，将正态分布的公式带入kl loss的公式进行计算
   kl = logs_p - logs_q - 0.5
   kl += 0.5 * ((z_p - m_p)**2) * torch.exp(-2. * logs_p)
   kl = torch.sum(kl * z_mask)

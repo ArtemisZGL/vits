@@ -86,9 +86,12 @@ class DDSConv(nn.Module):
     for i in range(n_layers):
       dilation = kernel_size ** i
       padding = (kernel_size * dilation - dilation) // 2
+      # group是channel个数，即，channel维度并没有进行信息整合
+      # 同时进行了dilation操作，是kernel size ** i
       self.convs_sep.append(nn.Conv1d(channels, channels, kernel_size, 
           groups=channels, dilation=dilation, padding=padding
       ))
+      # depth wise conv，只进行channel维度的信息整合
       self.convs_1x1.append(nn.Conv1d(channels, channels, 1))
       self.norms_1.append(LayerNorm(channels))
       self.norms_2.append(LayerNorm(channels))
@@ -109,10 +112,11 @@ class DDSConv(nn.Module):
 
 
 class WN(torch.nn.Module):
+  # wavenet
   def __init__(self, hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels=0, p_dropout=0):
     super(WN, self).__init__()
     assert(kernel_size % 2 == 1)
-    self.hidden_channels =hidden_channels
+    self.hidden_channels = hidden_channels
     self.kernel_size = kernel_size,
     self.dilation_rate = dilation_rate
     self.n_layers = n_layers
@@ -124,10 +128,12 @@ class WN(torch.nn.Module):
     self.drop = nn.Dropout(p_dropout)
 
     if gin_channels != 0:
+      # speaker embeddings映射
       cond_layer = torch.nn.Conv1d(gin_channels, 2*hidden_channels*n_layers, 1)
       self.cond_layer = torch.nn.utils.weight_norm(cond_layer, name='weight')
 
     for i in range(n_layers):
+      # 核心是1维的空洞卷积，并且网络越深，空洞越大，但这里的dilation_rate似乎是1，相当于没有
       dilation = dilation_rate ** i
       padding = int((kernel_size * dilation - dilation) / 2)
       in_layer = torch.nn.Conv1d(hidden_channels, 2*hidden_channels, kernel_size,
@@ -209,6 +215,7 @@ class ResBlock1(torch.nn.Module):
 
     def forward(self, x, x_mask=None):
         for c1, c2 in zip(self.convs1, self.convs2):
+            # 对于每个小block，leaky_relu, conv1, leaky_relu, conv2, 残差连接
             xt = F.leaky_relu(x, LRELU_SLOPE)
             if x_mask is not None:
                 xt = xt * x_mask
@@ -269,8 +276,10 @@ class Log(nn.Module):
 
 class Flip(nn.Module):
   def forward(self, x, *args, reverse=False, **kwargs):
+    # 将序列进行反转
     x = torch.flip(x, [1])
     if not reverse:
+      # 行列式为0
       logdet = torch.zeros(x.size(0)).to(dtype=x.dtype, device=x.device)
       return x, logdet
     else:
@@ -280,6 +289,7 @@ class Flip(nn.Module):
 class ElementwiseAffine(nn.Module):
   def __init__(self, channels):
     super().__init__()
+    # 相当于没有原本的coupling layer没有进行分组，并且每个channel中都是直接使用同一组均值方差
     self.channels = channels
     self.m = nn.Parameter(torch.zeros(channels,1))
     self.logs = nn.Parameter(torch.zeros(channels,1))
@@ -316,28 +326,36 @@ class ResidualCouplingLayer(nn.Module):
     self.mean_only = mean_only
 
     self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
+    # 这里用的也是wavenet，原因还是在于音频序列较长，空洞卷积能扩大感受野同时也减少计算量
     self.enc = WN(hidden_channels, kernel_size, dilation_rate, n_layers, p_dropout=p_dropout, gin_channels=gin_channels)
     self.post = nn.Conv1d(hidden_channels, self.half_channels * (2 - mean_only), 1)
     self.post.weight.data.zero_()
     self.post.bias.data.zero_()
 
   def forward(self, x, x_mask, g=None, reverse=False):
+    # 用x0预测均值方差，作用于x1，最后将两者进行拼接
+
+    # 首先将input分成两部分
     x0, x1 = torch.split(x, [self.half_channels]*2, 1)
+    # 通过pre映射channel后，通过wavenet提取特征，并通过post映射为均值和方差
     h = self.pre(x0) * x_mask
     h = self.enc(h, x_mask, g=g)
     stats = self.post(h) * x_mask
+    # 这里实现是只预测均值，方差都默认为1，因此flow在转换时的行列式(方差乘积)都是1
     if not self.mean_only:
       m, logs = torch.split(stats, [self.half_channels]*2, 1)
     else:
       m = stats
-      logs = torch.zeros_like(m)
+      logs = torch.zeros_like(m)  # log1=0
 
     if not reverse:
-      x1 = m + x1 * torch.exp(logs) * x_mask
-      x = torch.cat([x0, x1], 1)
-      logdet = torch.sum(logs, [1,2])
+      # 训练正向
+      x1 = m + x1 * torch.exp(logs) * x_mask  # 将x1进行affine操作，就是线性映射*方差+均值
+      x = torch.cat([x0, x1], 1)  # 再将两者进行拼接
+      logdet = torch.sum(logs, [1,2])  # log方差求和即方差求积，即flow的行列式
       return x, logdet
     else:
+      # 推理反向
       x1 = (x1 - m) * torch.exp(-logs) * x_mask
       x = torch.cat([x0, x1], 1)
       return x
@@ -361,18 +379,24 @@ class ConvFlow(nn.Module):
     self.proj.bias.data.zero_()
 
   def forward(self, x, x_mask, g=None, reverse=False):
+    # 划分channel
     x0, x1 = torch.split(x, [self.half_channels]*2, 1)
+    # 映射channel
     h = self.pre(x0)
+    # 通过DDSConv，结合了深度可分离卷积和空洞卷积的方式提取特征
     h = self.convs(h, x_mask, g=g)
+    # 映射为3k-1个参数
     h = self.proj(h) * x_mask
 
     b, c, t = x0.shape
     h = h.reshape(b, c, -1, t).permute(0, 1, 3, 2) # [b, cx?, t] -> [b, c, t, ?]
 
+    # 3k-1个参数类似均值方差的作用，类似分成K段的样条函数
     unnormalized_widths = h[..., :self.num_bins] / math.sqrt(self.filter_channels)
     unnormalized_heights = h[..., self.num_bins:2*self.num_bins] / math.sqrt(self.filter_channels)
     unnormalized_derivatives = h[..., 2 * self.num_bins:]
 
+    # 在tail_bound[-5,5]以外的取值不变，里面划分成K段，对x1进行变换
     x1, logabsdet = piecewise_rational_quadratic_transform(x1,
         unnormalized_widths,
         unnormalized_heights,
